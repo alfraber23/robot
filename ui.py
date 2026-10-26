@@ -74,6 +74,7 @@ class VentanaPrincipal(ctk.CTk):
     def finalizar(self, exito: bool) -> None:
         """Reactiva los controles cuando el robot termina."""
         self.barra_progreso.stop()
+        self.barra_progreso.configure(mode="determinate")
         if exito:
             self.barra_progreso.set(1)
             self.boton_iniciar.configure(text="Cerrar Robot", state="normal", command=self.destroy)
@@ -81,6 +82,13 @@ class VentanaPrincipal(ctk.CTk):
             self.barra_progreso.set(0)
             self.boton_iniciar.configure(text="Iniciar Digitalización", state="normal",
                                          command=self.arrancar_robot)
+
+    def actualizar_progreso(self, actual: int, total: int) -> None:
+        """Cambia la barra a modo determinista y muestra el avance real."""
+        self.barra_progreso.stop()
+        self.barra_progreso.configure(mode="determinate")
+        fraccion = max(0.0, min(1.0, actual / total)) if total > 0 else 0.0
+        self.barra_progreso.set(fraccion)
 
 
 class InteraccionUI(Interaccion):
@@ -113,20 +121,18 @@ class InteraccionUI(Interaccion):
         color = COLORES.get(nivel, COLORES["info"])
         self.app.after(0, lambda: self.app.label_estado.configure(text=mensaje, text_color=color))
 
+    def progreso(self, actual: int, total: int) -> None:
+        self.app.after(0, lambda: self.app.actualizar_progreso(actual, total))
+
     def pedir_datos_manuales(self, paciente: str, episodio: str, modo: str,
                              broker_sugerido: str = "",
-                             sugeridos: Optional[DatosManuales] = None) -> DatosManuales:
+                             sugeridos: Optional[DatosManuales] = None,
+                             pedir_operador: bool = False) -> DatosManuales:
         def abrir():
             popup = VentanaPreguntas(self.app, paciente, episodio, modo,
-                                     broker_sugerido, sugeridos)
+                                     broker_sugerido, sugeridos, pedir_operador=pedir_operador)
             self.app.wait_window(popup)
             return popup.datos
-
-        datos = self._en_hilo_principal(abrir)
-        if datos is None:
-            log.warning("Ventana cerrada sin guardar: se usará 'N/A' en los datos manuales.")
-            return DatosManuales()
-        return datos
 
         datos = self._en_hilo_principal(abrir)
         if datos is None:
@@ -226,6 +232,7 @@ class VentanaOpciones(ctk.CTkToplevel):
             ctk.CTkRadioButton(self, text=texto + sugerido, variable=self._var, value=i,
                                font=("Roboto", 12)).pack(padx=25, pady=6, anchor="w")
         ctk.CTkButton(self, text="Usar el seleccionado", command=self._aceptar).pack(pady=20)
+        self.bind("<Return>", lambda _e: self._aceptar())
 
     def _tomar_foco(self) -> None:
         try:
@@ -288,6 +295,7 @@ class VentanaPreguntas(ctk.CTkToplevel):
     """
 
     _CAMPOS = {
+        "operador": ("Operador que trabajó el alta:", "Ej. Karina, Paty, Alberto..."),
         "broker": ("Broker (PDS):", "Ej. GNP, N/A..."),
         "vobo": ("Quién dio VoBo (Supervisor):", "Ej. MARIO, N/A..."),
         "hora_cajas": ("Hora mandada a cajas:", "Ej. 14:30..."),
@@ -302,11 +310,13 @@ class VentanaPreguntas(ctk.CTkToplevel):
 
     def __init__(self, master, paciente: str, episodio: str, modo: str = "completo",
                  broker_sugerido: str = "",
-                 sugeridos: Optional[DatosManuales] = None):
+                 sugeridos: Optional[DatosManuales] = None,
+                 pedir_operador: bool = False):
         super().__init__(master)
         self.title("Faltan Datos")
         self.datos: Optional[DatosManuales] = None
-        self._claves = self._POR_MODO.get(modo, self._POR_MODO["completo"])
+        claves_base = list(self._POR_MODO.get(modo, self._POR_MODO["completo"]))
+        self._claves = (["operador"] + claves_base) if pedir_operador else claves_base
         self._entradas = {}
 
         ancho, alto = 400, 300 + 85 * len(self._claves)
@@ -340,21 +350,40 @@ class VentanaPreguntas(ctk.CTkToplevel):
             if valor and valor.strip().upper() != "N/A":
                 entrada.insert(0, valor)
 
+            entrada.bind("<Return>", lambda _e, c=clave: self._al_enter(c))
             self._entradas[clave] = entrada
 
         self.lbl_error = ctk.CTkLabel(self, text="", text_color="red",
                                       font=("Roboto", 12, "bold"))
         self.lbl_error.pack(pady=(0, 5))
-        ctk.CTkButton(self, text="Guardar y Continuar", font=("Roboto", 14),
+        ctk.CTkButton(self, text="Guardar y Continuar (Enter)", font=("Roboto", 14),
                       command=self.guardar_datos).pack(pady=(10, 20))
+        self.bind("<Return>", lambda _e: self.guardar_datos())
 
     def _tomar_foco(self) -> None:
         try:
             self.lift()
             self.focus_force()
             self.grab_set()
+            # Enfocar automáticamente el primer campo vacío (o el último si todos tienen valor)
+            for clave in self._claves:
+                entrada = self._entradas[clave]
+                if not entrada.get().strip():
+                    entrada.focus_set()
+                    return
+            if self._claves:
+                self._entradas[self._claves[-1]].focus_set()
         except TclError:
             log.debug("No se pudo tomar el foco del pop-up (ventana aún no visible).")
+
+    def _al_enter(self, clave_actual: str) -> None:
+        """Al presionar Enter en un campo: salta al siguiente vacío o guarda si ya están todos."""
+        for clave in self._claves:
+            if not self._entradas[clave].get().strip():
+                if clave != clave_actual or not self._entradas[clave_actual].get().strip():
+                    self._entradas[clave].focus_set()
+                    return
+        self.guardar_datos()
 
     def guardar_datos(self) -> None:
         valores = {clave: entrada.get().strip() for clave, entrada in self._entradas.items()}

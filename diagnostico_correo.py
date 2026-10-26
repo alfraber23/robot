@@ -30,7 +30,7 @@ def main():
     try:
         prov.conectar()
         print(f"\n[i] BUZÓN CONFIGURADO EN configuracion.py: {config.buzon_correo}")
-        print(f"    Carpetas a revisar: {config.carpetas_correo}")
+        print(f"    Carpetas a revisar: {prov.obtener_carpetas_busqueda()}")
     except ErrorCorreo as exc:
         print(f"\n[ERROR] {exc}")
         sys.exit(1)

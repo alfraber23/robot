@@ -68,6 +68,7 @@ class Tarea:
     """Un estado de cuenta ya elegido para procesar."""
     doc: Documento
     broker: str = ""           # p. ej. "PDS" si el episodio tiene documento de broker
+    correo_alta: Optional[object] = None   # CorreoAlta correlacionado (si existe)
 
 
 @dataclass
@@ -77,6 +78,7 @@ class DatosManuales:
     vobo: str = "N/A"
     hora_cajas: str = "N/A"
     respuesta_hab: str = "N/A"
+    operador: str = ""
 
 
 @dataclass

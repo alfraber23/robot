@@ -11,13 +11,10 @@ import logging
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from excepciones import ErrorConfiguracion
 from reglas import PALABRAS_VALIDACION_PORTAL
-
-from dataclasses import dataclass, field, fields
-from typing import List, Optional
 
 log = logging.getLogger("CFG")
 
@@ -98,13 +95,14 @@ class Config:
     # --- Auditoría financiera ---
     tolerancia_auditoria: float = 2.00
 
-    #CODIGO DE DEEPSEEK PARA INTENTAR IMPLEMENTAR EL CORREO *******************************************************************
-    buzon_correo: str = "supervisorcuentashac@saludangeles.mx"
-    # Si True, solo se procesan episodios que tengan un correo de alta.
-    # Si Outlook no está disponible, se cae al comportamiento anterior (procesar todos).
-    filtrar_por_correo: bool = True
     # --- Correo (Outlook de escritorio) ---
-    habilitar_correo: bool = True           # por seguridad, empieza apagado
+    # Si buzon_correo está vacío, se detecta automáticamente cuál de los 4 correos_analistas
+    # está configurado en el Outlook de esta PC.
+    buzon_correo: str = ""
+    # Si True, solo se procesan episodios que tengan un correo de alta.
+    # Si Outlook no está disponible o no hay correos del día, se procesan todos pidiendo el operador al final.
+    filtrar_por_correo: bool = True
+    habilitar_correo: bool = True
 
     operadores_firma: List[str] = field(default_factory=lambda: [
         "Alberto", "Angela", "Mariana", "Karina",
@@ -127,14 +125,29 @@ class Config:
         "admision.cscr@saludangeles.mx",
         "cajas.cscr@saludangeles.mx",
     ])
-    # Cada entrada: [buzón, tipo_de_carpeta]. buzón "" = el del usuario actual.
-    # tipo: "sent" | "inbox" | nombre literal (lo que muestre el diagnóstico).
-    carpetas_correo: List[List[str]] = field(default_factory=lambda: [
-        ["supervisorcuentashac@saludangeles.mx", "sent"],
-        ["supervisorcuentashac@saludangeles.mx", "inbox"],
-    ])
-    dias_busqueda_correo: int = 3
-    #*****************************************************
+    # Cada entrada: [buzón, tipo_de_carpeta]. Si la lista está vacía, el robot
+    # detecta automáticamente el buzón del analista en esta PC y revisa "sent" e "inbox".
+    carpetas_correo: List[List[str]] = field(default_factory=list)
+    dias_busqueda_correo: int = 1
+    forzar_sincronizacion_correo: bool = True
+    pausa_sincronizacion_correo: float = 4.0
+
+    # --- Catálogo de Brokers (PDS) por correo ---
+    # Mapea el nombre que se escribe en bitácora -> correos / dominios identificadores.
+    catalogo_brokers: Dict[str, List[str]] = field(default_factory=lambda: {
+        "VIMED": ["analisis@cvimed.com", "@cvimed.com", "cvimed.com"],
+        "HS": [
+            "cartas.gdl@healthservice.com.mx",
+            "contacto.gdl@healthservice.com.mx",
+            "@healthservice.com.mx",
+            "healthservice.com.mx",
+        ],
+        "AMES": ["ale.amesoluciones@gmail.com", "amesoluciones"],
+        "AXIS": ["axis.reportesdelcarmen@outlook.com"],
+        "ARSAM": ["reportepxarsamhealth@outlook.com", "arsamhealth"],
+        "PROMEDIC": ["vinculacion@pmconcierge.com.mx", "@pmconcierge.com.mx", "pmconcierge.com.mx"],
+    })
+    dias_busqueda_brokers: int = 7
 
     @property
     def ruta_bitacora(self) -> Path:

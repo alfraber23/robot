@@ -142,11 +142,11 @@ def main():
         print(f"[ERROR] {exc}")
         sys.exit(1)
 
-    desde = date.today() - timedelta(days=2)
+    desde = date.today() - timedelta(days=config.dias_busqueda_correo)
     total_general = 0
 
     try:
-        for entrada in config.carpetas_correo:
+        for entrada in prov.obtener_carpetas_busqueda():
             entrada = (entrada + ["", ""])[:2]
             buzon_nombre, tipo_carpeta = entrada[0], entrada[1]
             total_general += procesar_carpeta(prov, buzon_nombre, tipo_carpeta, desde)

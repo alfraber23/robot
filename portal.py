@@ -4,9 +4,10 @@ Todas las esperas son EXPLÍCITAS (WebDriverWait): avanzan en cuanto el elemento
 está listo y solo fallan cuando se agota el tiempo máximo de la configuración.
 """
 import logging
+import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from selenium import webdriver
 from selenium.common.exceptions import (NoSuchElementException, TimeoutException,
@@ -305,14 +306,129 @@ class PortalExpedientes(PortalBase):
 class PortalECH(PortalBase):
     """Portal ECH: de aquí se lee la hora de alta del paciente."""
 
+    _XPATH_SIGUIENTE_PAGINA = (
+        "//button[contains(@class, 'p-paginator-next')]"
+        " | //*[local-name()='svg' and contains(@class, 'p-paginator-icon')]"
+        "[.//*[local-name()='path' and starts-with(@d, 'M5.25 11.1728')]]"
+    )
+    _RE_EPISODIO = re.compile(r"\b(\d{7,12})\b")
+
     def __init__(self, driver, config: Config):
         super().__init__(driver, config, "ECH")
         self.conectado = False
+        self._cache_horas: Dict[str, str] = {}
+        self._tabla_completa_leida = False
+
+    def _clic_ech(self, locador, descripcion: str, timeout: Optional[int] = None):
+        """Clic robusto para componentes PrimeNG/SVG (usa fallback JS si el clic nativo es interceptado)."""
+        elem = self.esperar(EC.presence_of_element_located(locador), descripcion, timeout)
+        try:
+            WebDriverWait(self.driver, min(timeout or self.cfg.timeout_ech, 5)).until(
+                EC.element_to_be_clickable(locador)
+            )
+            elem.click()
+        except WebDriverException:
+            self.driver.execute_script(
+                "const root = arguments[0];"
+                "const inner = root.querySelector ? root.querySelector('.p-multiselect-trigger, .p-multiselect, .p-checkbox-box') : null;"
+                "const el = inner || root.closest('button, .p-multiselect, .p-checkbox-box, [role=\"checkbox\"]') || root;"
+                "if (typeof el.click === 'function') { el.click(); } "
+                "else { el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true})); }",
+                elem,
+            )
+        return elem
+
+    def _configurar_filtro_engrane(self, timeout: int) -> None:
+        """Abre el engrane de 'altas clínicas (últimos 10 días)', despliega #admissionTypeItem,
+        marca todos, activa 'Incluir dados de alta = Sí' y presiona Buscar.
+        """
+        self.log.info("Configurando filtro en el engrane de 'Altas clínicas (últimos 10 días)'...")
+        # 1) Clic en el engrane correspondiente a "altas clínicas (últimos 10 días)" (5.º engrane):
+        minusculas = f"translate(text(), '{_MAYUS}', '{_MINUS}')"
+        xpath_engrane = (
+            f"(//span[contains({minusculas}, 'altas cl') and contains({minusculas}, 'ltimos')]"
+            f"/following::i[contains(@class, 'pi-cog')])[1]"
+            f" | (//i[contains(@class, 'pi-cog')])[5]"
+        )
+        self._clic_ech(
+            (By.XPATH, xpath_engrane),
+            "engrane de 'altas clínicas (últimos 10 días)' (i.pi.pi-cog)",
+            timeout,
+        )
+        self.pausa(0.5)
+
+        # 2) Clic en la lista desplegable por ID: <p-multiselect id="admissionTypeItem">
+        self.esperar(
+            EC.presence_of_element_located((By.ID, "admissionTypeItem")),
+            "contenedor #admissionTypeItem",
+            timeout,
+        )
+        self._clic_ech(
+            (
+                By.CSS_SELECTOR,
+                "#admissionTypeItem .p-multiselect-trigger, #admissionTypeItem .p-multiselect, #admissionTypeItem",
+            ),
+            "lista desplegable (#admissionTypeItem)",
+            timeout,
+        )
+        self.pausa(0.5)
+
+        # 3) Clic en marcar todos: <div role="checkbox" class="p-checkbox-box" aria-checked="false">
+        xpath_check = (
+            "//div[contains(@class, 'p-multiselect-header')]//div[@role='checkbox' and contains(@class, 'p-checkbox-box')]"
+            " | (//div[@role='checkbox' and contains(@class, 'p-checkbox-box') and @aria-checked='false'])[1]"
+        )
+        checkbox = self.esperar(
+            EC.presence_of_element_located((By.XPATH, xpath_check)),
+            "casilla 'Marcar todos' (p-checkbox-box)",
+            timeout,
+        )
+        if (checkbox.get_attribute("aria-checked") or "").lower() != "true":
+            self._clic_ech((By.XPATH, xpath_check), "casilla 'Marcar todos'", timeout)
+            self.pausa(0.5)
+        else:
+            self.log.info("La casilla 'Marcar todos' ya estaba marcada.")
+
+        # 4) "Incluir en la búsqueda los dados de alta" -> clic en botón "Sí"
+        xpath_si_dados_alta = (
+            "(//span[contains(normalize-space(), 'Incluir en la b') or contains(normalize-space(), 'dados de alta')]"
+            "/following::div[@role='button' and (@aria-label='Sí' or @aria-labelledby='Sí' "
+            "or .//span[contains(@class, 'p-button-label') and (normalize-space()='Sí' or normalize-space()='Si')])])[1]"
+            " | //div[@role='button' and (@aria-label='Sí' or @aria-labelledby='Sí')]"
+        )
+        boton_si = self.esperar(
+            EC.presence_of_element_located((By.XPATH, xpath_si_dados_alta)),
+            "botón 'Sí' de 'Incluir en la búsqueda los dados de alta'",
+            timeout,
+        )
+        if (boton_si.get_attribute("aria-pressed") or "").lower() != "true":
+            self._clic_ech(
+                (By.XPATH, xpath_si_dados_alta),
+                "botón 'Sí' (Incluir en la búsqueda los dados de alta)",
+                timeout,
+            )
+            self.pausa(0.5)
+        else:
+            self.log.info("El botón 'Sí' (Incluir dados de alta) ya estaba seleccionado.")
+
+        # 5) Clic en Buscar: <button id="search-worklist-save-worklist"><span class="p-button-label">Buscar</span></button>
+        self._clic_ech(
+            (
+                By.XPATH,
+                "//button[@id='search-worklist-save-worklist']"
+                " | //button[.//span[contains(@class, 'p-button-label') and normalize-space()='Buscar']]",
+            ),
+            "botón 'Buscar' (search-worklist-save-worklist)",
+            timeout,
+        )
+        self.pausa(1.0)
 
     def iniciar_sesion(self, historial: bool = False) -> None:
-        """historial=True: usa la pestaña 'Altas clínicas (últimos 10 días)' en lugar de la de hoy."""
+        """Ingresa a ECH, abre siempre 'Altas clínicas (últimos 10 días)' y aplica el filtro del engrane."""
         self.log.info("Iniciando sesión en portal ECH (pestaña nueva)...")
         t = self.cfg.timeout_ech
+        self._cache_horas.clear()
+        self._tabla_completa_leida = False
         try:
             self.driver.execute_script("window.open('');")
             self.handle = self.driver.window_handles[-1]
@@ -329,18 +445,20 @@ class PortalECH(PortalBase):
             self.clic((By.XPATH, "//img[contains(@src, 'Gestion-de-hospitalizados')]"),
                       "módulo 'Gestión de hospitalizados' (¿credenciales ECH incorrectas?)", t)
             self.clic((By.ID, "home-navigate-to-discharge-38"), "tarjeta de altas", t)
+
             minusculas = f"translate(text(), '{_MAYUS}', '{_MINUS}')"
-            if historial:
-                self.log.info("Fecha anterior: se usará la pestaña 'Altas clínicas (últimos 10 días)'.")
-                self.clic((By.XPATH, f"//span[contains({minusculas}, 'altas cl') and contains({minusculas}, 'ltimos')]"),
-                          "pestaña 'Altas clínicas (últimos 10 días)'", t)
-            else:
-                self.clic((By.XPATH, f"//span[contains({minusculas}, 'altas cl') and not(contains({minusculas}, 'ltimos'))]"),
-                          "pestaña 'Altas clínicas'", t)
+            self.log.info("Abriendo pestaña 'Altas clínicas (últimos 10 días)'...")
+            self.clic(
+                (By.XPATH, f"//span[contains({minusculas}, 'altas cl') and contains({minusculas}, 'ltimos')]"),
+                "pestaña 'Altas clínicas (últimos 10 días)'",
+                t,
+            )
+
+            self._configurar_filtro_engrane(t)
 
             if self.esperar_opcional(EC.presence_of_element_located((By.XPATH, "//tbody//tr")),
                                      "filas en la tabla de altas", t):
-                self.log.info("Conectado y en espera en la tabla de altas.")
+                self.log.info("Conectado y tabla de altas cargada tras aplicar filtro.")
             else:
                 self.log.warning("Conectado, pero la tabla de altas aún no muestra filas.")
             self.conectado = True
@@ -351,24 +469,118 @@ class PortalECH(PortalBase):
             self.conectado = False
             raise
 
-    def extraer_hora_alta(self, episodio: str) -> str:
-        """Hora de alta del episodio, 'NO_ENCONTRADA' o 'ERROR'. Nunca lanza excepción."""
-        self.log.info("Consultando hora de alta para Ep: %s...", episodio)
-        xpath_fila = f"//tr[.//span[contains(text(), '{episodio}')]]"
-        try:
-            fila = self.esperar_opcional(
-                EC.presence_of_element_located((By.XPATH, xpath_fila)),
-                f"fila del episodio {episodio} en la tabla de altas", self.cfg.timeout_ech_fila)
-            if fila is None:
-                self.log.warning("Paciente no encontrado en la tabla de altas.")
-                return "NO_ENCONTRADA"
+    def _leer_pagina_actual(self, episodio_buscado: str) -> Tuple[Optional[str], Tuple[str, ...]]:
+        """Lee la página actual de la tabla, guarda en caché (episodio -> hora) y devuelve
+        (hora_del_episodio_buscado_si_aparece, huella_de_filas_de_la_pagina).
+        """
+        huella: List[str] = []
+        hora_encontrada: Optional[str] = None
 
-            celda = self.driver.find_element(By.XPATH, f"{xpath_fila}/td[2]")
-            texto = celda.text.strip()
-            self.log.info("Texto de la celda de hora en la tabla: %r", texto)
-            hora = texto.split(" ")[-1] if " " in texto else texto
-            self.log.info("Hora detectada: %s", hora)
+        filas = self.driver.find_elements(By.XPATH, "//tbody//tr")
+        for fila in filas:
+            try:
+                texto_fila = (fila.text or "").strip()
+                if not texto_fila:
+                    continue
+                huella.append(texto_fila)
+                celdas = fila.find_elements(By.TAG_NAME, "td")
+                if len(celdas) < 2:
+                    continue
+                texto_hora = celdas[1].text.strip()
+                hora = texto_hora.split(" ")[-1] if " " in texto_hora else texto_hora
+                if not hora:
+                    continue
+                for ep_match in self._RE_EPISODIO.findall(texto_fila):
+                    self._cache_horas.setdefault(ep_match, hora)
+                    if ep_match == episodio_buscado:
+                        hora_encontrada = hora
+            except WebDriverException:
+                continue
+
+        # Verificación directa por XPath del episodio por si el formato difiere del regex
+        if hora_encontrada is None:
+            xpath_fila = f"//tr[.//span[contains(text(), '{episodio_buscado}')]]"
+            if self.driver.find_elements(By.XPATH, xpath_fila):
+                celda = self.driver.find_element(By.XPATH, f"{xpath_fila}/td[2]")
+                texto = celda.text.strip()
+                hora_encontrada = texto.split(" ")[-1] if " " in texto else texto
+                self._cache_horas[episodio_buscado] = hora_encontrada
+
+        return hora_encontrada, tuple(huella)
+
+    def _avanzar_pagina(self) -> bool:
+        """Da clic en el botón de página siguiente. Devuelve False si ya no hay más páginas."""
+        elementos = self.driver.find_elements(By.XPATH, self._XPATH_SIGUIENTE_PAGINA)
+        if not elementos:
+            return False
+
+        # Preferir el elemento visible; verificar si su botón contenedor está deshabilitado
+        objetivo = next((e for e in elementos if e.is_displayed()), elementos[0])
+        esta_deshabilitado = self.driver.execute_script(
+            "const btn = arguments[0].closest('button') || arguments[0];"
+            "return Boolean(btn.disabled || btn.classList.contains('p-disabled') "
+            "|| btn.getAttribute('aria-disabled') === 'true');",
+            objetivo,
+        )
+        if esta_deshabilitado:
+            return False
+
+        self.driver.execute_script(
+            "const btn = arguments[0].closest('button') || arguments[0];"
+            "if (typeof btn.click === 'function') { btn.click(); } "
+            "else { btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true})); }",
+            objetivo,
+        )
+        self.pausa(0.8)
+        return True
+
+    def extraer_hora_alta(self, episodio: str) -> str:
+        """Hora de alta del episodio recorriendo la paginación, 'NO_ENCONTRADA' o 'ERROR'."""
+        episodio = str(episodio).strip()
+        self.log.info("Consultando hora de alta para Ep: %s...", episodio)
+
+        if episodio in self._cache_horas:
+            hora = self._cache_horas[episodio]
+            self.log.info("Hora detectada (en caché de ECH): %s", hora)
             return hora
+
+        if self._tabla_completa_leida:
+            self.log.warning("El episodio %s no está en ninguna página de la tabla de altas.", episodio)
+            return "NO_ENCONTRADA"
+
+        try:
+            self.esperar_opcional(
+                EC.presence_of_element_located((By.XPATH, "//tbody//tr")),
+                "filas en la tabla de altas",
+                self.cfg.timeout_ech_fila,
+            )
+
+            huella_anterior: Tuple[str, ...] = ()
+            max_paginas = 50
+            for pagina in range(1, max_paginas + 1):
+                hora, huella_actual = self._leer_pagina_actual(episodio)
+                if hora:
+                    self.log.info("Hora detectada en página %d: %s", pagina, hora)
+                    return hora
+
+                if not huella_actual:
+                    self.log.warning("La tabla de altas no muestra filas.")
+                    return "NO_ENCONTRADA"
+
+                if huella_anterior and huella_actual == huella_anterior:
+                    self.log.info("La tabla se repitió en la página %d; fin de paginación alcanzado.", pagina)
+                    self._tabla_completa_leida = True
+                    break
+
+                huella_anterior = huella_actual
+                if not self._avanzar_pagina():
+                    self.log.info("No hay más páginas en la tabla de altas (fin en página %d).", pagina)
+                    self._tabla_completa_leida = True
+                    break
+                self.log.debug("Avanzando a la siguiente página de ECH (página %d)...", pagina + 1)
+
+            self.log.warning("Paciente (Ep %s) no encontrado tras recorrer las páginas de ECH.", episodio)
+            return "NO_ENCONTRADA"
         except WebDriverException as exc:
             self.log.error("Fallo al leer la hora de alta: %s", _mensaje(exc))
             return "ERROR"

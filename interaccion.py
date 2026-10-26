@@ -15,15 +15,20 @@ class Interaccion(ABC):
     def estado(self, mensaje: str, nivel: str = "ok") -> None:
         """Muestra un estado. nivel: 'ok' | 'aviso' | 'error' | 'info'."""
 
+    def progreso(self, actual: int, total: int) -> None:
+        """Actualiza el progreso determinista (actual de total)."""
+
     @abstractmethod
     def pedir_datos_manuales(self, paciente: str, episodio: str, modo: str,
                              broker_sugerido: str = "",
-                             sugeridos: Optional[DatosManuales] = None) -> DatosManuales:
+                             sugeridos: Optional[DatosManuales] = None,
+                             pedir_operador: bool = False) -> DatosManuales:
         """Bloquea hasta que el operador captura los datos manuales.
 
         modo: 'completo' | 'particular' | 'hemo' | 'simple'.
         sugeridos: valores ya conocidos (hora del correo, etc.) que la UI
                    debe precargar en el pop-up para que el operador solo confirme.
+        pedir_operador: True cuando no se pudo obtener el operador desde el correo.
         """
 
     @abstractmethod

@@ -6,9 +6,12 @@ No requiere Azure ni permisos de admin: usa la sesión de Outlook.
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+import time
 import unicodedata
+
+from excepciones import ErrorCorreo
 
 log = logging.getLogger("MAIL")
 
@@ -52,6 +55,8 @@ _OPERADORES = [
 
 _CARGOS_FIRMA = [
     "Supervisor de Análisis de Cuentas",
+    "Supervisora de Análisis de Cuentas",
+    "Supervisor Análisis de Cuentas",
     "Analista de Cuentas",
     "Análisis de Cuentas",
 ]
@@ -120,6 +125,17 @@ class CorreoAlta:
         return self.enviado.strftime("%H:%M")
 
 
+@dataclass
+class CorreoBroker:
+    """Un correo de broker (o reenviado por Julio) para llenar el campo Broker/PDS."""
+    broker: str          # "VIMED", "HS", "AMES", "AXIS", "ARSAM", "PROMEDIC"
+    asunto: str
+    remitente: str
+    enviado: datetime
+    cuerpo_texto: str = ""
+    adjuntos: List[str] = field(default_factory=list)
+
+
 class ProveedorCorreoOutlook:
     """Lee correos desde Outlook de escritorio."""
 
@@ -161,6 +177,47 @@ class ProveedorCorreoOutlook:
         except Exception:
             pass
         log.info("Conectado a Outlook (perfil: %s).", perfil or "?")
+        self.forzar_sincronizacion()
+
+    def forzar_sincronizacion(self) -> None:
+        """Fuerza a Outlook Clásico a sincronizar con Exchange (SendAndReceive + SyncObjects)."""
+        if self._ns is None or not getattr(self.cfg, "forzar_sincronizacion_correo", True):
+            return
+        try:
+            if getattr(self._ns, "Offline", False):
+                log.warning(
+                    "AVISO: Outlook Clásico está en modo 'Trabajar sin conexión' (Offline). "
+                    "Desactívalo en la pestaña 'Enviar y recibir' de Outlook Clásico para recibir correos actuales."
+                )
+        except Exception:
+            pass
+
+        log.info("Forzando sincronización de Outlook Clásico con el servidor Exchange...")
+        sincronizado = False
+        try:
+            self._ns.SendAndReceive(False)
+            sincronizado = True
+        except Exception as exc:
+            log.debug("SendAndReceive no disponible: %s", exc)
+
+        try:
+            sync_objs = self._ns.SyncObjects
+            for i in range(1, sync_objs.Count + 1):
+                try:
+                    sync_objs.Item(i).Start()
+                    sincronizado = True
+                except Exception:
+                    continue
+        except Exception as exc:
+            log.debug("SyncObjects no disponible: %s", exc)
+
+        if sincronizado:
+            pausa = max(0.0, float(getattr(self.cfg, "pausa_sincronizacion_correo", 4.0)))
+            if pausa > 0:
+                log.info("Esperando %.1f s para descargar correos recientes...", pausa)
+                time.sleep(pausa)
+        else:
+            log.warning("No fue posible disparar la sincronización automática de Outlook.")
 
     def desconectar(self) -> None:
         self._ns = None
@@ -217,11 +274,19 @@ class ProveedorCorreoOutlook:
                 try:
                     carpeta = buzon.Folders.Item(j)
                     filtro = self._filtro_fecha(desde, hasta, carpeta.Name)
-                    items = carpeta.Items.Restrict(filtro)
+                    try:
+                        items = carpeta.Items.Restrict(filtro) if filtro else carpeta.Items
+                    except Exception:
+                        items = carpeta.Items
                     conteo = 0
                     for k in range(1, min(items.Count, limite) + 1):
                         try:
-                            if self._es_correo_altas(items.Item(k)):
+                            msg = items.Item(k)
+                            fecha = self._fecha_mensaje(msg, carpeta.Name)
+                            if fecha is None or not (desde <= fecha.date() <= hasta):
+                                continue
+                            es_alta, _ = self._es_correo_altas(msg)
+                            if es_alta:
                                 conteo += 1
                         except Exception:
                             pass
@@ -232,14 +297,48 @@ class ProveedorCorreoOutlook:
         return resultado
 
     # ---------------- búsqueda principal ----------------
-    def buscar_altas(self, desde: date, hasta: date) -> List[CorreoAlta]:
+    MAX_CORREOS_POR_CARPETA = 150
+    CORTE_FUERA_DE_RANGO = 20
+
+    def _fecha_extremo(self, items, inicio: int, fin: int, paso: int, tipo_carpeta: str) -> Optional[datetime]:
+        """Obtiene la primera fecha válida cerca de un extremo de la colección (máx 5 intentos)."""
+        tope = 5
+        revisados = 0
+        idx = inicio
+        while (paso > 0 and idx <= fin) or (paso < 0 and idx >= fin):
+            revisados += 1
+            if revisados > tope:
+                break
+            try:
+                fecha = self._fecha_mensaje(items.Item(idx), tipo_carpeta)
+                if fecha is not None:
+                    return fecha
+            except Exception:
+                pass
+            idx += paso
+        return None
+
+    def _indices_recientes(self, items, total: int, tipo_carpeta: str, limite: int) -> range:
+        """Devuelve el rango de índices empezando SIEMPRE por los correos más recientes,
+        acotado como máximo a `limite` elementos.
+        """
+        if total <= 1:
+            return range(1, total + 1)
+        f_primero = self._fecha_extremo(items, 1, total, 1, tipo_carpeta)
+        f_ultimo = self._fecha_extremo(items, total, 1, -1, tipo_carpeta)
+        if f_primero and f_ultimo and f_ultimo > f_primero:
+            return range(total, max(0, total - limite), -1)
+        return range(1, min(total, limite) + 1)
+
+    def buscar_altas(self, desde: date, hasta: date,
+                     max_correos: int = MAX_CORREOS_POR_CARPETA) -> List[CorreoAlta]:
         if self._ns is None:
             self.conectar()
 
         correos: List[CorreoAlta] = []
         vistos = set()
 
-        for entrada in self.cfg.carpetas_correo:
+        for entrada in self.obtener_carpetas_busqueda():
             buzon_nombre, tipo_carpeta = (entrada + ["", ""])[:2]
             carpeta = self._obtener_carpeta(buzon_nombre, tipo_carpeta)
             if carpeta is None:
@@ -248,16 +347,15 @@ class ProveedorCorreoOutlook:
                 continue
 
             try:
-                items = carpeta.Items
-                total = items.Count
+                items_base = carpeta.Items
+                total_carpeta = items_base.Count
             except Exception as exc:
                 log.warning("No se pudo abrir '%s/%s': %s",
                             buzon_nombre or "(actual)", tipo_carpeta, exc)
                 continue
 
-            log.info("Revisando %d correo(s) en '%s/%s'...",
-                     total, buzon_nombre or "(actual)", tipo_carpeta)
-            if total == 0:
+            if total_carpeta == 0:
+                log.info("Carpeta '%s/%s' vacía.", buzon_nombre or "(actual)", tipo_carpeta)
                 continue
 
             # Reset de stats por carpeta
@@ -265,19 +363,41 @@ class ProveedorCorreoOutlook:
                 self._stats[k] = 0
 
             campo = "SentOn" if "sent" in tipo_carpeta.lower() else "ReceivedTime"
+
+            # 1) Intentar acotar con Restrict al rango exacto [desde, hasta]
+            items = items_base
+            filtro = self._filtro_fecha(desde, hasta, tipo_carpeta)
+            if filtro:
+                try:
+                    restringidos = items_base.Restrict(filtro)
+                    if restringidos.Count > 0:
+                        items = restringidos
+                        log.info("Filtro Restrict en '%s/%s': %d correo(s) en [%s → %s] (de %d totales).",
+                                 buzon_nombre or "(actual)", tipo_carpeta,
+                                 items.Count, desde.strftime("%d.%m.%Y"),
+                                 hasta.strftime("%d.%m.%Y"), total_carpeta)
+                except Exception as exc:
+                    log.debug("Restrict no aplicó en '%s/%s': %s", buzon_nombre, tipo_carpeta, exc)
+
+            # 2) Ordenar por fecha descendente y detectar extremo más reciente
             try:
                 items.Sort(f"[{campo}]", True)
                 ordenado = True
             except Exception as exc:
-                log.warning("No se pudo ordenar '%s' por %s: %s. Se iterará completo.",
-                            tipo_carpeta, campo, exc)
+                log.warning("No se pudo ordenar '%s' por %s: %s.", tipo_carpeta, campo, exc)
                 ordenado = False
+
+            total = items.Count
+            indices = self._indices_recientes(items, total, tipo_carpeta, max_correos)
+            log.info("Revisando hasta %d correo(s) recientes en '%s/%s' (rango %s → %s)...",
+                     len(indices), buzon_nombre or "(actual)", tipo_carpeta,
+                     desde.strftime("%d.%m.%Y"), hasta.strftime("%d.%m.%Y"))
 
             primera = ultima = None
             fuera_de_rango = 0
             altas_en_carpeta = 0
 
-            for i in range(1, total + 1):
+            for i in indices:
                 try:
                     msg = items.Item(i)
                     self._stats["procesados"] += 1
@@ -287,15 +407,15 @@ class ProveedorCorreoOutlook:
                     if primera is None:
                         primera = fecha
 
+                    if fecha.date() > hasta:
+                        continue
+
                     if fecha.date() < desde:
                         fuera_de_rango += 1
-                        if ordenado and fuera_de_rango >= 100:
+                        if ordenado and fuera_de_rango >= self.CORTE_FUERA_DE_RANGO:
                             break
                         continue
                     fuera_de_rango = 0
-
-                    if fecha.date() > hasta:
-                        continue
                     ultima = fecha
 
                     es_alta, remitente = self._es_correo_altas(msg)
@@ -320,7 +440,6 @@ class ProveedorCorreoOutlook:
                                  remitente,
                                  (getattr(msg, "Subject", "") or "")[:90])
                 except Exception as exc:
-                    # A nivel WARNING para que NUNCA se oculte
                     log.warning("Error procesando correo %d: %s: %s",
                                 i, exc.__class__.__name__, exc)
 
@@ -342,6 +461,157 @@ class ProveedorCorreoOutlook:
         log.info("Correos de altas encontrados: %d", len(correos))
         return correos
 
+    # ---------------- búsqueda de brokers (PDS) en lote ----------------
+    MAX_CORREOS_BROKERS = 350
+
+    def _identificar_broker_mensaje(self, msg) -> Tuple[str, str, str]:
+        """Devuelve (broker_canonico, remitente_smtp, cuerpo_texto) si el correo
+        pertenece a uno de los brokers del catálogo o fue reenviado (p. ej. por el Lic. Julio).
+        """
+        catalogo: Dict[str, List[str]] = getattr(self.cfg, "catalogo_brokers", {}) or {}
+        if not catalogo:
+            return "", "", ""
+
+        remitente = self._direccion_remitente(msg).lower()
+        nombre_rem = (getattr(msg, "SenderName", "") or "").lower()
+
+        # 1) Match directo en remitente o nombre visible del remitente
+        for broker, claves in catalogo.items():
+            if any(c.lower() in remitente or c.lower() in nombre_rem for c in claves if c):
+                try:
+                    cuerpo = msg.Body or ""
+                except Exception:
+                    cuerpo = ""
+                return broker, remitente, cuerpo
+
+        # 2) Reenvíos (del Lic. Julio o reenvíos internos donde el correo del broker viene en el cuerpo)
+        try:
+            asunto = (getattr(msg, "Subject", "") or "").lower()
+        except Exception:
+            asunto = ""
+
+        es_julio_o_reenvio = (
+            "julio" in remitente
+            or "julio" in nombre_rem
+            or asunto.startswith(("rv:", "fw:", "fwd:", "re:"))
+            or any(c.lower() in asunto for claves in catalogo.values() for c in claves if c)
+        )
+        if not es_julio_o_reenvio:
+            return "", remitente, ""
+
+        try:
+            cuerpo = msg.Body or ""
+        except Exception:
+            cuerpo = ""
+        texto_busqueda = f"{asunto}\n{cuerpo.lower()}"
+
+        for broker, claves in catalogo.items():
+            if any(c.lower() in texto_busqueda for c in claves if c):
+                return broker, remitente, cuerpo
+
+        return "", remitente, ""
+
+    def buscar_correos_brokers(self, desde: date, hasta: date,
+                               max_correos: int = MAX_CORREOS_BROKERS) -> List[CorreoBroker]:
+        """Busca en lote correos de brokers (última semana) en las carpetas de entrada."""
+        if self._ns is None:
+            self.conectar()
+
+        encontrados: List[CorreoBroker] = []
+        vistos = set()
+
+        # Revisar principalmente inbox (donde llegan los correos de brokers y reenvíos de Julio)
+        entradas_todas = self.obtener_carpetas_busqueda()
+        entradas_inbox = [e for e in entradas_todas if "inbox" in (e[1] if len(e) > 1 else "").lower()]
+        carpetas_a_revisar = entradas_inbox or entradas_todas
+
+        for entrada in carpetas_a_revisar:
+            buzon_nombre, tipo_carpeta = (entrada + ["", ""])[:2]
+            carpeta = self._obtener_carpeta(buzon_nombre, tipo_carpeta)
+            if carpeta is None:
+                continue
+
+            try:
+                items_base = carpeta.Items
+                total_carpeta = items_base.Count
+            except Exception as exc:
+                log.debug("No se pudo abrir '%s/%s' para brokers: %s", buzon_nombre, tipo_carpeta, exc)
+                continue
+
+            if total_carpeta == 0:
+                continue
+
+            campo = "SentOn" if "sent" in tipo_carpeta.lower() else "ReceivedTime"
+            items = items_base
+            filtro = self._filtro_fecha(desde, hasta, tipo_carpeta)
+            if filtro:
+                try:
+                    restringidos = items_base.Restrict(filtro)
+                    if restringidos.Count > 0:
+                        items = restringidos
+                except Exception:
+                    pass
+
+            try:
+                items.Sort(f"[{campo}]", True)
+                ordenado = True
+            except Exception:
+                ordenado = False
+
+            total = items.Count
+            indices = self._indices_recientes(items, total, tipo_carpeta, max_correos)
+            log.info("Buscando correos de brokers en '%s/%s' (%s → %s, máx %d correos)...",
+                     buzon_nombre or "(actual)", tipo_carpeta,
+                     desde.strftime("%d.%m.%Y"), hasta.strftime("%d.%m.%Y"), len(indices))
+
+            fuera_de_rango = 0
+            for i in indices:
+                try:
+                    msg = items.Item(i)
+                    fecha = self._fecha_mensaje(msg, tipo_carpeta)
+                    if fecha is None:
+                        continue
+                    if fecha.date() > hasta:
+                        continue
+                    if fecha.date() < desde:
+                        fuera_de_rango += 1
+                        if ordenado and fuera_de_rango >= self.CORTE_FUERA_DE_RANGO:
+                            break
+                        continue
+                    fuera_de_rango = 0
+
+                    broker, remitente, cuerpo = self._identificar_broker_mensaje(msg)
+                    if not broker:
+                        continue
+
+                    asunto = getattr(msg, "Subject", "") or ""
+                    clave = (broker, asunto.strip().lower(), fecha.strftime("%Y%m%d%H%M"))
+                    if clave in vistos:
+                        continue
+                    vistos.add(clave)
+
+                    adjuntos: List[str] = []
+                    try:
+                        for j in range(1, msg.Attachments.Count + 1):
+                            adjuntos.append(msg.Attachments.Item(j).FileName)
+                    except Exception:
+                        pass
+
+                    encontrados.append(CorreoBroker(
+                        broker=broker,
+                        asunto=asunto,
+                        remitente=remitente,
+                        enviado=fecha,
+                        cuerpo_texto=cuerpo,
+                        adjuntos=adjuntos,
+                    ))
+                except Exception as exc:
+                    log.debug("Error leyendo correo %d en búsqueda de brokers: %s", i, exc)
+
+        encontrados.sort(key=lambda c: c.enviado, reverse=True)
+        log.info("Correos de brokers encontrados en la semana: %d", len(encontrados))
+        return encontrados
+
     @staticmethod
     def _fecha_mensaje(msg, tipo_carpeta: str):
         """Fecha del mensaje, robusta ante distintos tipos de retorno de Outlook."""
@@ -358,6 +628,53 @@ class ProveedorCorreoOutlook:
         return None
 
     # ---------------- internos ----------------
+    def obtener_carpetas_busqueda(self) -> List[List[str]]:
+        """Determina automáticamente el buzón de analista en esta PC y devuelve
+        los pares [buzon, 'sent'] y [buzon, 'inbox'] a revisar.
+        """
+        if self.cfg.carpetas_correo:
+            return [list(e) for e in self.cfg.carpetas_correo]
+
+        if self.cfg.buzon_correo:
+            b = self.cfg.buzon_correo.strip()
+            log.info("Usando buzón configurado explícitamente: %s (sent e inbox).", b)
+            return [[b, "sent"], [b, "inbox"]]
+
+        if self._ns is None:
+            self.conectar()
+
+        detectados: List[str] = []
+        for i in range(1, self._ns.Folders.Count + 1):
+            try:
+                buzon = self._ns.Folders.Item(i)
+                smtp = (self._smtp_del_buzon(buzon) or "").lower().strip()
+                nombre = (buzon.Name or "").lower().strip()
+                for analista in self._analistas:
+                    usuario_analista = analista.split("@")[0]
+                    if (
+                        (smtp and smtp == analista)
+                        or analista in nombre
+                        or (usuario_analista and (usuario_analista == nombre or usuario_analista in smtp or usuario_analista in nombre))
+                    ):
+                        identificador = smtp or buzon.Name
+                        if identificador not in detectados:
+                            detectados.append(identificador)
+                            log.info("Buzón de analista seleccionado automáticamente en esta PC: %s", identificador)
+                        break
+            except Exception:
+                continue
+
+        if detectados:
+            carpetas: List[List[str]] = []
+            for b in detectados:
+                carpetas.append([b, "sent"])
+                carpetas.append([b, "inbox"])
+            return carpetas
+
+        log.info("No se identificó el buzón por nombre entre los 4 analistas; "
+                 "se usará el buzón predeterminado de Outlook en esta PC (sent e inbox).")
+        return [["", "sent"], ["", "inbox"]]
+
     def _obtener_carpeta(self, buzon_nombre: str, tipo_carpeta: str):
         try:
             # Si no se especifica buzón, usar el default de Outlook
@@ -456,8 +773,11 @@ class ProveedorCorreoOutlook:
         return smtps
 
     def _filtro_fecha(self, desde: date, hasta: date, tipo_carpeta: str) -> str:
-        
-        return ""
+        t = (tipo_carpeta or "").lower()
+        campo = "SentOn" if ("sent" in t or "enviado" in t) else "ReceivedTime"
+        fin = hasta + timedelta(days=1)
+        return (f"[{campo}] >= '{desde.strftime('%d/%m/%Y')} 00:00' "
+                f"AND [{campo}] < '{fin.strftime('%d/%m/%Y')} 00:00'")
 
 
     def _direccion_remitente(self, msg) -> str:

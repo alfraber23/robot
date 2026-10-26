@@ -2,9 +2,9 @@
 import logging
 import time
 from contextlib import contextmanager, nullcontext
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from selenium.common.exceptions import InvalidSessionIdException, NoSuchWindowException
 
@@ -12,9 +12,10 @@ from auditoria import AuditoriaFinanciera
 from bitacora import Bitacora
 from carpetas import ResolutorCarpetas
 from configuracion import DIR_BASE, Config
+from correo import CorreoAlta, CorreoBroker, ProveedorCorreoOutlook
 from documentos import (BuscadorDocumentos, LectorDocumentos, extraer_texto_completo,
                         limpiar_temporales, ultima_pagina_temporal)
-from excepciones import ErrorCarpeta, ErrorDigitalizador, ErrorPortal
+from excepciones import ErrorCarpeta, ErrorCorreo, ErrorDigitalizador, ErrorPortal
 from interaccion import Interaccion
 from inventario import construir_inventario
 from modelos import DatosManuales, RegistroBitacora, Resultado, Tarea, filas_a_tsv
@@ -23,9 +24,6 @@ from reglas import (SEGUROS_CON_RESUMEN, SEGUROS_CON_VISADO, contiene_alguna,
                     normalizar_aseguradora)
 from seleccion import resolver_expediente
 from servidor import ServidorLocal
-
-from datetime import date, datetime, timedelta   # si timedelta no estaba
-from correo import CorreoAlta, ProveedorCorreoOutlook
 
 log = logging.getLogger("SYS")
 log_manual = logging.getLogger("MANUAL")
@@ -121,13 +119,29 @@ class RobotDigitalizador:
                 self._iniciar_navegador()
 
             total = len(tareas)
+            pendientes_bitacora: List[Tuple[Tarea, str, str, str]] = []
             for numero, tarea in enumerate(tareas, start=1):
-                self.ui.estado(f"Procesando {numero}/{total}: {tarea.doc.paciente}")
+                self.ui.progreso(numero - 1, total)
+                self.ui.estado(f"Fase web {numero}/{total}: {tarea.doc.paciente}")
                 inicio = time.perf_counter()
-                resultado = self._procesar(tarea)
+                resultado, pendiente = self._procesar(tarea)
                 self.resultados[resultado] += 1
+                if pendiente is not None:
+                    pendientes_bitacora.append(pendiente)
+                self.ui.progreso(numero, total)
                 log_tiempo.info("Paciente %d/%d (%s): %.1f s", numero, total,
                                 tarea.doc.episodio, time.perf_counter() - inicio)
+
+            if pendientes_bitacora:
+                with self._medir("Buscar brokers (PDS) en correo"):
+                    self._identificar_brokers_en_lote(pendientes_bitacora)
+                total_bit = len(pendientes_bitacora)
+                log.info("Fase web concluida. Iniciando captura manual de bitácora (%d episodio(s))...",
+                         total_bit)
+                for idx, (tarea, compania, modo, hora_alta) in enumerate(pendientes_bitacora, start=1):
+                    self.ui.progreso(idx - 1, total_bit)
+                    self._capturar_bitacora(tarea, compania, modo, hora_alta, idx, total_bit)
+                    self.ui.progreso(idx, total_bit)
         finally:
             with self._medir("Guardado final de bitácora"):
                 self._guardar_bitacora_final()
@@ -201,8 +215,9 @@ class RobotDigitalizador:
             return tareas
 
         if not self.correos_altas:
-            log.warning("Sin correos de altas precargados: no se puede filtrar. "
-                        "Se procesan todas las %d tarea(s) por seguridad.", len(tareas))
+            log.warning("AVISO: No hay correos de altas del día disponibles. "
+                        "Se procesan las %d tarea(s) y se pedirá el operador en el formulario final.",
+                        len(tareas))
             return tareas
 
         filtradas: List[Tarea] = []
@@ -210,6 +225,7 @@ class RobotDigitalizador:
         for tarea in tareas:
             match = self._correlacionar(tarea.doc)
             if match:
+                tarea.correo_alta = match
                 log.info("Ep %s (%s): alta confirmada en correo (%s, %s).",
                          tarea.doc.episodio, tarea.doc.paciente,
                          match.operador or match.operador_firma or "?",
@@ -230,32 +246,15 @@ class RobotDigitalizador:
                  len(filtradas), len(tareas), len(omitidas))
 
         if not filtradas:
-            raise ErrorDigitalizador(
-                "Ningún episodio de la carpeta tiene alta registrada en correo. "
-                "Revisa que los analistas hayan enviado los correos de alta o "
-                "deshabilita 'filtrar_por_correo' en config.json.")
+            log.warning(
+                "AVISO: Ningún episodio de la carpeta coincidió con los correos del día. "
+                "Se continuará procesando las %d tarea(s) y se pedirá el operador en el formulario final.",
+                len(tareas),
+            )
+            self.ui.estado("Aviso: sin coincidencias en correo; se pedirá el operador al final.", "aviso")
+            return tareas
 
         return filtradas
-
-        self.ui.estado("Eligiendo el estado de cuenta de cada episodio...")
-        tareas: List[Tarea] = []
-        for exp in inventario.expedientes:
-            res = resolver_expediente(exp, self.cfg.nombre_servicios_especializados,
-                                      self.cfg.palabras_broker, self._preguntar_opcion)
-            for ignorado in res.ignorados:
-                log.info("Ep %s | no se sube: %s", exp.episodio, ignorado)
-            if res.faltante:
-                log.warning("FALTANTE: %s", res.faltante)
-                self.faltantes.append(res.faltante)
-            if res.tarea:
-                tareas.append(res.tarea)
-
-        if not tareas:
-            for texto in self.faltantes:
-                log.warning("  - %s", texto)
-            raise ErrorDigitalizador("No hay estados de cuenta que se puedan procesar en las carpetas.")
-        log.info("Episodios por procesar: %d", len(tareas))
-        return tareas
 
     # ---------------- preparación ----------------
     def _preparar_bitacora(self) -> None:
@@ -302,24 +301,35 @@ class RobotDigitalizador:
     def _precargar_correos(self) -> None:
         """Conecta a Outlook y precarga las altas (una sola vez por corrida)."""
         if not self.cfg.habilitar_correo:
-            log.info("Correo deshabilitado en config.json. Se omite precarga.")
+            log.warning("AVISO: Correo deshabilitado en config.json. "
+                        "Se continuará y se pedirá el operador en el formulario del final.")
             return
         try:
             self._correo = ProveedorCorreoOutlook(self.cfg)
             self._correo.conectar()
             desde = self.fecha - timedelta(days=1)
-            hasta = self.fecha + timedelta(days=1)
+            hasta = self.fecha
             self.correos_altas = self._correo.buscar_altas(desde, hasta)
+            if not self.correos_altas:
+                log.warning("AVISO: No se encontraron correos de altas del día (%s → %s). "
+                            "Se continuará y se pedirá el operador en el formulario del final.",
+                            desde.strftime("%d.%m.%Y"), hasta.strftime("%d.%m.%Y"))
+                self.ui.estado("Aviso: no se encontraron correos del día. Se pedirá el operador al final.", "aviso")
+                return
             con_firma = sum(1 for c in self.correos_altas if c.operador)
             log.info("Correo: %d altas precargadas (%s → %s). Con firma legible: %d.",
                      len(self.correos_altas),
                      desde.strftime("%d.%m.%Y"), hasta.strftime("%d.%m.%Y"),
                      con_firma)
         except ErrorCorreo as exc:
-            log.warning("Correo no disponible: %s. Se continúa sin datos del correo.", exc)
+            log.warning("AVISO: No se pudo abrir el correo (%s). "
+                        "Se continuará y se pedirá el operador en el formulario del final.", exc)
+            self.ui.estado("Aviso: no se pudo abrir Outlook. Se pedirá el operador al final.", "aviso")
             self.correos_altas = []
         except Exception as exc:
-            log.exception("Error inesperado precargando correos: %s", exc)
+            log.exception("AVISO: Error inesperado precargando correos (%s). "
+                          "Se continuará y se pedirá el operador en el formulario del final.", exc)
+            self.ui.estado("Aviso: fallo al leer Outlook. Se pedirá el operador al final.", "aviso")
             self.correos_altas = []
 
     def _correlacionar(self, doc) -> Optional[CorreoAlta]:
@@ -337,14 +347,20 @@ class RobotDigitalizador:
         candidatos = [
             c for c in self.correos_altas
             if abs((c.enviado.date() - fecha_doc).days) <= 1
+            or (self.fecha - timedelta(days=1) <= c.enviado.date() <= self.fecha)
         ]
         if not candidatos:
             return None
 
-        # 1) Match por episodio
+        # 1) Match por episodio (en asunto, adjuntos o cuerpo)
         ep = str(doc.episodio).strip()
         if ep and len(ep) >= 6:
-            con_ep = [c for c in candidatos if ep in c.asunto]
+            con_ep = [
+                c for c in candidatos
+                if ep in c.asunto
+                or any(ep in adj for adj in c.adjuntos)
+                or ep in (c.cuerpo_texto or "")
+            ]
             if con_ep:
                 return max(con_ep, key=lambda c: c.enviado)
 
@@ -365,10 +381,89 @@ class RobotDigitalizador:
             return mejor
         return None
 
+    def _identificar_brokers_en_lote(
+        self, pendientes: List[Tuple[Tarea, str, str, str]]
+    ) -> None:
+        """Busca en lote los correos de brokers de la última semana para todos los pacientes
+        que ya terminaron su fase web, llenando automáticamente `tarea.broker`.
+        """
+        if not self.cfg.habilitar_correo:
+            return
+        # Solo aplica a episodios cuyo modo pide broker ("completo")
+        candidatos_tareas = [t for t, _cia, modo, _h in pendientes if modo == "completo"]
+        if not candidatos_tareas:
+            return
+
+        self.ui.estado("Buscando correos de brokers (PDS) de la semana...")
+        try:
+            if self._correo is None:
+                self._correo = ProveedorCorreoOutlook(self.cfg)
+                self._correo.conectar()
+            dias = max(1, int(getattr(self.cfg, "dias_busqueda_brokers", 7)))
+            desde = self.fecha - timedelta(days=dias)
+            hasta = self.fecha
+            correos_brokers = self._correo.buscar_correos_brokers(desde, hasta)
+        except Exception as exc:
+            log.warning("AVISO: No se pudieron consultar correos de brokers (%s).", exc)
+            return
+
+        if not correos_brokers:
+            log.info("No se encontraron correos de brokers en los últimos %d días.", dias)
+            return
+
+        for tarea in candidatos_tareas:
+            broker_detectado = self._correlacionar_broker(tarea.doc, correos_brokers)
+            if broker_detectado:
+                tarea.broker = broker_detectado
+                log.info("Ep %s (%s): Broker detectado automáticamente por correo -> %s",
+                         tarea.doc.episodio, tarea.doc.paciente, broker_detectado)
+
+    @staticmethod
+    def _correlacionar_broker(doc, correos_brokers: List[CorreoBroker]) -> str:
+        """Cruza un paciente con la lista de correos de brokers por episodio o nombre del paciente."""
+        if not correos_brokers:
+            return ""
+
+        from documentos import normalizar as _norm
+
+        # 1) Match por número de episodio
+        ep = str(doc.episodio).strip()
+        if ep and len(ep) >= 6:
+            for c in correos_brokers:
+                if (
+                    ep in c.asunto
+                    or any(ep in adj for adj in c.adjuntos)
+                    or ep in (c.cuerpo_texto or "")
+                ):
+                    return c.broker
+
+        # 2) Match por nombre del paciente en asunto, adjuntos o cuerpo del correo
+        pac_norm = _norm(doc.paciente)
+        palabras = [p for p in pac_norm.split() if len(p) >= 3]
+        if not palabras:
+            return ""
+
+        mejor_broker = ""
+        mejor_score = 0
+        minimo = max(2, len(palabras) - 1)
+
+        for c in correos_brokers:
+            texto_norm = _norm(f"{c.asunto} {' '.join(c.adjuntos)} {c.cuerpo_texto}")
+            if pac_norm and pac_norm in texto_norm:
+                return c.broker
+            score = sum(1 for p in palabras if p in texto_norm)
+            if score > mejor_score:
+                mejor_score = score
+                mejor_broker = c.broker
+
+        if mejor_broker and mejor_score >= minimo:
+            return mejor_broker
+        return ""
+
     # ==================================================================
     # Procesamiento de un documento (con red de seguridad)
     # ==================================================================
-    def _procesar(self, tarea: Tarea) -> Resultado:
+    def _procesar(self, tarea: Tarea) -> Tuple[Resultado, Optional[Tuple[Tarea, str, str, str]]]:
         doc = tarea.doc
         try:
             return self._procesar_documento(tarea)
@@ -381,7 +476,7 @@ class RobotDigitalizador:
             log.exception("[%s] Error inesperado procesando el documento", doc.nombre)
             self._incidencia(f"{doc.nombre} (Ep {doc.episodio}): error inesperado (ver traceback arriba)")
         self._recuperar_portal()
-        return Resultado.ERROR
+        return Resultado.ERROR, None
 
     def _recuperar_portal(self) -> None:
         """Tras un error, deja el portal listo para el siguiente documento."""
@@ -391,7 +486,7 @@ class RobotDigitalizador:
         except Exception as exc:
             log.warning("No se pudo reiniciar el portal tras el error: %s", exc)
 
-    def _procesar_documento(self, tarea: Tarea) -> Resultado:
+    def _procesar_documento(self, tarea: Tarea) -> Tuple[Resultado, Optional[Tuple[Tarea, str, str, str]]]:
         doc = tarea.doc
         log.info("=" * 50)
         log.info("Procesando %s: %s (%s)", doc.tipo.upper(), doc.nombre, doc.ruta.parent.name)
@@ -409,10 +504,11 @@ class RobotDigitalizador:
         else:
             modo = "completo"
             if not self._flujo_web(doc):
-                return Resultado.OMITIDO
+                return Resultado.OMITIDO, None
+            self.portal.abrir_busqueda()
 
-        self._fase_bitacora(doc, compania, modo, tarea.broker)
-        return Resultado.PROCESADO
+        pendiente = self._preparar_pendiente_bitacora(tarea, compania, modo)
+        return Resultado.PROCESADO, pendiente
 
     # ------------------------------------------------------------------
     def _flujo_web(self, doc) -> bool:
@@ -502,56 +598,68 @@ class RobotDigitalizador:
         self.faltantes.append(mensaje)
 
     # ------------------------------------------------------------------
-    def _fase_bitacora(self, doc, compania: str, modo: str, broker_sugerido: str) -> None:
+    def _preparar_pendiente_bitacora(
+        self, tarea: Tarea, compania: str, modo: str
+    ) -> Optional[Tuple[Tarea, str, str, str]]:
+        """Verifica si el episodio requiere registro en bitácora y pre-consulta su hora de alta en ECH."""
+        doc = tarea.doc
         ya_registrado = (self.bitacora.contiene(doc.episodio)
                          or any(r.episodio == doc.episodio for r in self.registros_nuevos))
         if ya_registrado:
             log.info("El episodio %s ya está en la bitácora local. Se omite captura manual y registro.",
                      doc.episodio)
-        else:
-            # Buscar el alta en el correo (ya filtrada al inicio, pero volvemos a obtener
-            # el match para tener hora y operador).
-            match = self._correlacionar(doc) if self.correos_altas else None
-            if match:
-                log_manual.info(
-                    "Correo: Ep %s | hora=%s | operador=%r (firma: %r)",
-                    doc.episodio, match.hora_cajas,
-                    match.operador or "?", match.operador_firma or "?")
+            return None
 
-            # Construir "sugeridos" desde el correo. Solo precargamos lo que el correo
-            # puede darnos hoy: la hora a cajas. Los demás campos siguen siendo manuales.
-            sugeridos = DatosManuales()
-            if match and match.hora_cajas:
-                sugeridos.hora_cajas = match.hora_cajas
+        hora_alta = self._obtener_hora_alta(doc.episodio)
+        return (tarea, compania, modo, hora_alta)
 
-            self.ui.estado(f"Esperando datos manuales para: {doc.paciente}", "aviso")
-            log_manual.info("Solicitando datos en la interfaz para: %s (modo %s)",
-                            doc.paciente, modo)
-            datos = self.ui.pedir_datos_manuales(
-                doc.paciente, doc.episodio, modo, broker_sugerido, sugeridos=sugeridos)
-            log_manual.info("Datos capturados: %s", datos)
+    def _capturar_bitacora(self, tarea: Tarea, compania: str, modo: str,
+                           hora_alta: str, idx: int, total: int) -> None:
+        """Pide los datos manuales al operador y registra la fila en bitácora y respaldo."""
+        doc = tarea.doc
+        ya_registrado = (self.bitacora.contiene(doc.episodio)
+                         or any(r.episodio == doc.episodio for r in self.registros_nuevos))
+        if ya_registrado:
+            log.info("El episodio %s ya fue registrado en esta sesión. Se omite duplicado.", doc.episodio)
+            return
 
-            hora_alta = self._obtener_hora_alta(doc.episodio)
+        match = tarea.correo_alta or (self._correlacionar(doc) if self.correos_altas else None)
+        if match:
+            log_manual.info(
+                "Correo: Ep %s | hora=%s | operador=%r (firma: %r)",
+                doc.episodio, match.hora_cajas,
+                match.operador or "?", match.operador_firma or "?")
 
-            # Operador de la bitácora: el de la firma del correo (quien trabajó el alta).
-            # Si el correo no tiene firma, cae al operador que arrancó el robot.
-            operador_bitacora = self.operador
-            if match and match.operador:
-                operador_bitacora = match.operador
+        sugeridos = DatosManuales()
+        if match and match.hora_cajas:
+            sugeridos.hora_cajas = match.hora_cajas
 
-            registro = RegistroBitacora(
-                episodio=doc.episodio, habitacion=doc.habitacion, paciente=doc.paciente,
-                seguro=normalizar_aseguradora(compania), operador=operador_bitacora,
-                datos=datos, hora_alta=hora_alta)
+        operador_correo = (match.operador if match else "") or ""
+        pedir_operador = not bool(operador_correo or self.operador)
+        if pedir_operador:
+            log.warning("Ep %s (%s): sin operador detectado en correo. Se pedirá en el formulario final.",
+                        doc.episodio, doc.paciente)
 
-            if self.bitacora.disponible:
-                if self.bitacora.registrar(registro):
-                    self._guardar_para_pegar(registro)
-            else:
+        self.ui.estado(f"Datos manuales ({idx}/{total}): {doc.paciente}", "aviso")
+        log_manual.info("Solicitando datos en la interfaz (%d/%d) para: %s (modo %s, pedir_operador=%s)",
+                        idx, total, doc.paciente, modo, pedir_operador)
+        datos = self.ui.pedir_datos_manuales(
+            f"{doc.paciente} ({idx}/{total})", doc.episodio, modo, tarea.broker,
+            sugeridos=sugeridos, pedir_operador=pedir_operador)
+        log_manual.info("Datos capturados: %s", datos)
+
+        operador_bitacora = operador_correo or datos.operador or self.operador or "N/A"
+
+        registro = RegistroBitacora(
+            episodio=doc.episodio, habitacion=doc.habitacion, paciente=doc.paciente,
+            seguro=normalizar_aseguradora(compania), operador=operador_bitacora,
+            datos=datos, hora_alta=hora_alta)
+
+        if self.bitacora.disponible:
+            if self.bitacora.registrar(registro):
                 self._guardar_para_pegar(registro)
-
-        if modo == "completo":
-            self.portal.abrir_busqueda()
+        else:
+            self._guardar_para_pegar(registro)
 
     def _guardar_para_pegar(self, registro: RegistroBitacora) -> None:
         """Anota la fila en el archivo de texto (instantáneo) para no perderla si algo falla."""
