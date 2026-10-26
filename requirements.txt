@@ -1,0 +1,5 @@
+selenium
+PyPDF2
+openpyxl
+customtkinter
+pywin32

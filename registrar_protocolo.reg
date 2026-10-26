@@ -1,0 +1,11 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Classes\robothac]
+@="URL:Robot HAC Protocol"
+"URL Protocol"=""
+
+[HKEY_CURRENT_USER\Software\Classes\robothac\DefaultIcon]
+@="shell32.dll,1"
+
+[HKEY_CURRENT_USER\Software\Classes\robothac\shell\open\command]
+@="\"\\\\192.160.106.23\\Public\\Analisis de cuentas\\Ancts\\PRUEBAS\\robot_actualizado_py3\\launch_robot.bat\" \"%1\""
