@@ -12,13 +12,17 @@ from typing import Callable, List, Optional, Tuple
 
 from documentos import leer_detalle
 from inventario import Expediente
-from modelos import DetalleCuenta, Documento, Tarea
+from modelos import DetalleCuenta, Documento, Tarea, TipoProceso
 from reglas import formato_requerido
 
 log = logging.getLogger("SEL")
 
 # preguntar(titulo, mensaje, opciones, sugerida) -> índice elegido, o None si cancela
 Preguntar = Callable[[str, str, List[str], int], Optional[int]]
+# confirmar(titulo, mensaje) -> sí/no
+Confirmar = Callable[[str, str], bool]
+# elegir_varias(titulo, mensaje, opciones) -> índices marcados, o None
+ElegirVarias = Callable[[str, str, List[str]], Optional[List[int]]]
 
 _MARGEN_SEGUNDOS = 60
 
@@ -83,8 +87,36 @@ def elegir_estado_cuenta(candidatos: List[Documento], preguntar: Preguntar) -> T
     return mejor[0], motivo
 
 
+def preguntar_separacion(candidatos: List[Documento], confirmar: Optional[Confirmar],
+                         elegir_varias: Optional[ElegirVarias]) -> List[Documento]:
+    """Si hay 2+ estados de cuenta, pregunta si es separación de cuentas.
+
+    Devuelve los 2 o 3 documentos elegidos, o [] si NO es separación.
+    """
+    if len(candidatos) < 2 or confirmar is None or elegir_varias is None:
+        return []
+    ejemplo = candidatos[0]
+    if not confirmar("Separación de cuentas",
+                     f"El episodio {ejemplo.episodio} ({ejemplo.paciente}) tiene {len(candidatos)} "
+                     "estados de cuenta del seguro.\n\n¿Es una separación de cuentas?"):
+        return []
+    infos = [(d, leer_detalle(d)) for d in candidatos]
+    indices = elegir_varias(
+        "Estados de cuenta de la separación",
+        f"Marca los estados de cuenta a digitalizar del episodio {ejemplo.episodio} "
+        "(uno por carpetita roja):",
+        [_descripcion(d, det) for d, det in infos])
+    elegidos = [candidatos[i] for i in (indices or []) if 0 <= i < len(candidatos)]
+    if len(elegidos) < 2:
+        log.warning("Ep %s: se marcaron %d archivo(s); no se trata como separación.",
+                    ejemplo.episodio, len(elegidos))
+        return []
+    return elegidos
+
+
 def resolver_expediente(exp: Expediente, nombre_especializados: str, palabras_broker: List[str],
-                        preguntar: Preguntar) -> ResultadoExpediente:
+                        preguntar: Preguntar, confirmar: Optional[Confirmar] = None,
+                        elegir_varias: Optional[ElegirVarias] = None) -> ResultadoExpediente:
     res = ResultadoExpediente()
 
     if exp.seguros:
@@ -97,8 +129,14 @@ def resolver_expediente(exp: Expediente, nombre_especializados: str, palabras_br
                             f"solo hay estado de cuenta en {existentes} y se necesita {requerido}.")
             return res
 
-        doc, motivo = elegir_estado_cuenta(usables, preguntar)
-        res.ignorados = ([f"{d.nombre} (estado de cuenta del seguro no elegido)" for d in exp.seguros if d is not doc]
+        separados = preguntar_separacion(usables, confirmar, elegir_varias)
+        if separados:
+            doc, motivo = separados[0], f"separación de cuentas ({len(separados)} estados)"
+        else:
+            doc, motivo = elegir_estado_cuenta(usables, preguntar)
+        elegidos = separados or [doc]
+        res.ignorados = ([f"{d.nombre} (estado de cuenta del seguro no elegido)" for d in exp.seguros
+                          if d not in elegidos]
                          + [f"{d.nombre} (particular/complementario)" for d in exp.particulares]
                          + [f"{d.nombre} (broker: {d.compania})" for d in exp.brokers])
         broker = ""
@@ -106,7 +144,10 @@ def resolver_expediente(exp: Expediente, nombre_especializados: str, palabras_br
             texto = exp.brokers[0].compania.upper()
             broker = next((p.upper() for p in palabras_broker if p.upper() in texto), "PDS")
         res.tarea = Tarea(doc, broker)
-        log.info("Ep %s: se usa '%s' (%s).", exp.episodio, doc.nombre, motivo)
+        if separados:
+            res.tarea.tipo_proceso = TipoProceso.SEPARACION
+            res.tarea.docs_separacion = separados
+        log.info("Ep %s: se usa '%s' (%s).", exp.episodio, ", ".join(d.nombre for d in elegidos), motivo)
         return res
 
     # Sin estado de cuenta del seguro

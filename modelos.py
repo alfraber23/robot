@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 from reglas import normalizar_habitacion
 
@@ -63,12 +63,39 @@ class DetalleCuenta:
     complementario: bool = False       # particular que es deducible/coaseguro de un seguro (NC, etc.)
 
 
+class TipoProceso(Enum):
+    ALTA = "alta"                          # alta normal: 1 estado de cuenta
+    CORTE = "corte"                        # corte de cuenta: 1 estado, sin ECH ni pop-up
+    SEPARACION = "separacion"              # 2 o 3 estados de cuenta del mismo episodio
+    CORTE_SEPARACION = "corte_separacion"  # corte dividido en 2 o más facturas
+
+
 @dataclass
 class Tarea:
     """Un estado de cuenta ya elegido para procesar."""
     doc: Documento
     broker: str = ""           # p. ej. "PDS" si el episodio tiene documento de broker
     correo_alta: Optional[object] = None   # CorreoAlta correlacionado (si existe)
+    tipo_proceso: TipoProceso = TipoProceso.ALTA
+    docs_separacion: List[Documento] = field(default_factory=list)   # estados de cuenta (separación)
+
+    @property
+    def es_corte(self) -> bool:
+        return self.tipo_proceso in (TipoProceso.CORTE, TipoProceso.CORTE_SEPARACION)
+
+    @property
+    def es_separacion(self) -> bool:
+        return self.tipo_proceso in (TipoProceso.SEPARACION, TipoProceso.CORTE_SEPARACION)
+
+    @property
+    def estados_de_cuenta(self) -> List[Documento]:
+        """Los estados de cuenta a digitalizar (uno por carpetita roja)."""
+        return list(self.docs_separacion) if self.es_separacion and self.docs_separacion else [self.doc]
+
+    def marcar_corte(self) -> None:
+        """Convierte la tarea en corte (conservando si es separación)."""
+        self.tipo_proceso = (TipoProceso.CORTE_SEPARACION if self.es_separacion
+                             else TipoProceso.CORTE)
 
 
 @dataclass

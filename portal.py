@@ -15,7 +15,7 @@ from selenium.common.exceptions import (NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from configuracion import Config
 from excepciones import ErrorPortal
@@ -183,6 +183,150 @@ class PortalExpedientes(PortalBase):
             self.log.info("Episodio %s abierto.", episodio)
         except WebDriverException as exc:
             raise ErrorPortal(f"Fallo al abrir el episodio {episodio}: {_mensaje(exc)}") from exc
+
+    # ---------------- carpetitas rojas (cortes / separaciones) ----------------
+    _XPATH_FILAS = "//tr[@id][.//img[@title='Abrir']]"
+
+    def buscar_episodio(self, episodio: str) -> List[str]:
+        """Busca el episodio y se queda en la tabla de carpetitas. Devuelve los id de sus filas."""
+        self.log.info("Buscando episodio %s (tabla de carpetitas)...", episodio)
+        try:
+            if not self.driver.find_elements(By.NAME, "noExpediente"):
+                self.abrir_busqueda()
+            campo = self.esperar(EC.presence_of_element_located((By.NAME, "noExpediente")),
+                                 "campo de búsqueda de expediente")
+            campo.clear()
+            campo.send_keys(episodio)
+            self.clic((By.ID, "envioEpisodio"), "botón de búsqueda de episodio")
+            self.esperar(EC.element_to_be_clickable((By.XPATH, "//img[@title='Abrir']")),
+                         f"resultado del episodio {episodio} (¿existe en el portal?)")
+            self.pausa(0.5)
+            return self.ids_carpetas()
+        except WebDriverException as exc:
+            raise ErrorPortal(f"Fallo al buscar el episodio {episodio}: {_mensaje(exc)}") from exc
+
+    def ids_carpetas(self) -> List[str]:
+        """id de las filas <tr> que tienen carpetita roja, en orden numérico (0, 1, 2...)."""
+        ids = [f.get_attribute("id") for f in self.driver.find_elements(By.XPATH, self._XPATH_FILAS)]
+        ids = [i for i in ids if i is not None and i != ""]
+        return sorted(ids, key=lambda i: (0, int(i)) if i.isdigit() else (1, i))
+
+    def abrir_carpeta(self, id_fila: str) -> None:
+        """Abre la carpetita roja de la fila <tr id=id_fila> (la tabla debe estar visible)."""
+        self.log.info("Abriendo carpetita roja de la fila %s...", id_fila)
+        try:
+            boton = self.esperar(
+                EC.element_to_be_clickable((By.XPATH, f"//tr[@id='{id_fila}']//img[@title='Abrir']")),
+                f"carpetita roja de la fila {id_fila}")
+            boton.click()
+            try:
+                self.esperar_carga(boton)
+            except ErrorPortal as exc:
+                self.log.warning("%s. Se continúa de todos modos.", exc)
+            self.pausa()
+        except WebDriverException as exc:
+            raise ErrorPortal(f"Fallo al abrir la carpetita de la fila {id_fila}: {_mensaje(exc)}") from exc
+
+    def puede_digitalizar_estado_cuenta(self) -> bool:
+        """True si la carpetita abierta tiene libre la fila 'estado de cuenta' (campo de carga y sin y.png)."""
+        base = f"//tr[contains(translate(., '{_MAYUS}', '{_MINUS}'), 'estado de cuenta')]"
+        try:
+            if not self.driver.find_elements(By.XPATH, base):
+                self.log.info("La carpetita no tiene fila 'estado de cuenta'.")
+                return False
+            if self.driver.find_elements(By.XPATH, f"{base}//img[contains(@src, 'y.png')]"):
+                self.log.info("La carpetita ya tiene el estado de cuenta digitalizado.")
+                return False
+            libre = bool(self.driver.find_elements(By.XPATH, f"{base}//input[@type='file']"))
+            self.log.info("La carpetita %s disponible para digitalizar.", "SÍ está" if libre else "NO está")
+            return libre
+        except WebDriverException as exc:
+            self.log.warning("No se pudo revisar la carpetita (%s). Se considera ocupada.", _mensaje(exc))
+            return False
+
+    def codigo_asegurador(self, id_fila: str) -> str:
+        """Texto del 3er <td> (columna 'Cuenta') de la fila: identifica a la aseguradora activa."""
+        celdas = self.driver.find_elements(By.XPATH, f"//tr[@id='{id_fila}']/td")
+        if len(celdas) < 3:
+            raise ErrorPortal(f"La fila {id_fila} no tiene la columna 'Cuenta' (3er td).")
+        codigo = (celdas[2].text or "").strip()
+        self.log.info("Aseguradora activa (columna Cuenta, fila %s): %r", id_fila, codigo)
+        return codigo
+
+    def _seleccionar_asegurador(self, codigo: str) -> None:
+        select = Select(self.esperar(EC.element_to_be_clickable((By.ID, "asegurador")),
+                                     "selector de aseguradora"))
+        objetivo = codigo.strip().upper()
+        opciones = [(o.get_attribute("value") or "", (o.text or "").strip()) for o in select.options]
+        # 1) value exacto  2) texto exacto  3) el texto de la celda contiene el value  4) contiene el texto
+        reglas = [lambda v, t: v.upper() == objetivo,
+                  lambda v, t: t.upper() == objetivo,
+                  lambda v, t: bool(v) and v.upper() in objetivo.split(),
+                  lambda v, t: bool(t) and (t.upper() in objetivo or objetivo in t.upper())]
+        for regla in reglas:
+            for valor, texto in opciones:
+                if valor and regla(valor, texto):
+                    select.select_by_value(valor)
+                    self.log.info("Aseguradora seleccionada: %s (%s)", texto, valor)
+                    return
+        raise ErrorPortal(f"No se encontró la aseguradora {codigo!r} en el selector 'asegurador'. "
+                          f"Opciones: {', '.join(f'{v}={t}' for v, t in opciones if v)}")
+
+    def _confirmar_nuevo(self) -> None:
+        """Acepta la confirmación '¿Está seguro?' (alerta nativa o botón de un modal)."""
+        try:
+            alerta = WebDriverWait(self.driver, self.cfg.timeout_web).until(EC.alert_is_present())
+            self.log.info("Confirmación del portal: %s", alerta.text)
+            alerta.accept()
+        except TimeoutException:
+            botones = self.driver.find_elements(
+                By.XPATH, "//button[normalize-space()='Sí' or normalize-space()='Si' or normalize-space()='SI'"
+                          " or normalize-space()='Aceptar' or normalize-space()='OK' or normalize-space()='Ok']")
+            visibles = [b for b in botones if b.is_displayed()]
+            if not visibles:
+                raise ErrorPortal("No apareció la confirmación al crear la carpetita roja.")
+            visibles[0].click()
+        # Algunos portales muestran un segundo aviso ("creado correctamente")
+        try:
+            alerta = WebDriverWait(self.driver, self.cfg.timeout_alerta).until(EC.alert_is_present())
+            self.log.info("Aviso del portal: %s", alerta.text)
+            alerta.accept()
+        except TimeoutException:
+            pass
+
+    def crear_carpetita(self, episodio: str, codigo: str) -> str:
+        """Crea una carpetita roja nueva (Hospitalización + misma aseguradora). Devuelve el id de su fila.
+
+        Requiere estar en la tabla del episodio (tras buscar_episodio).
+        """
+        antes = set(self.ids_carpetas())
+        self.log.info("Creando carpetita roja nueva para el episodio %s (existentes: %d)...",
+                      episodio, len(antes))
+        try:
+            servicio = Select(self.esperar(EC.element_to_be_clickable((By.ID, "servicio")),
+                                           "selector de servicio"))
+            servicio.select_by_value("6")      # Hospitalización
+            self.clic((By.XPATH, "//input[@id='envio' and @value='Iniciar']"), "botón 'Iniciar'")
+            self._seleccionar_asegurador(codigo)
+            self.clic((By.ID, "nuevo"), "botón 'Nuevo'")
+            self._confirmar_nuevo()
+            self.esperar_carga()
+        except UnexpectedAlertPresentException as exc:
+            self._cerrar_alerta()
+            raise ErrorPortal(f"Alerta inesperada al crear la carpetita: "
+                              f"{getattr(exc, 'alert_text', None) or exc}") from exc
+        except WebDriverException as exc:
+            raise ErrorPortal(f"Fallo al crear la carpetita roja: {_mensaje(exc)}") from exc
+
+        nuevas = self.esperar_opcional(lambda d: set(self.ids_carpetas()) - antes,
+                                       "nueva fila de carpetita roja", self.cfg.timeout_web)
+        if not nuevas:   # la tabla no se refrescó sola: se vuelve a buscar
+            nuevas = set(self.buscar_episodio(episodio)) - antes
+        if not nuevas:
+            raise ErrorPortal("Se pidió crear la carpetita roja pero no apareció una fila nueva.")
+        nueva = sorted(nuevas, key=lambda i: (0, int(i)) if i.isdigit() else (1, i))[-1]
+        self.log.info("Carpetita roja creada en la fila %s.", nueva)
+        return nueva
 
     def validar_aseguradora(self, compania_doc: str) -> bool:
         """Seguro anti-cruces: el portal debe mostrar la misma aseguradora que el documento."""

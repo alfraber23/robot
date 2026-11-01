@@ -35,6 +35,15 @@ class Interaccion(ABC):
     def elegir_opcion(self, titulo: str, mensaje: str, opciones: List[str], sugerida: int) -> Optional[int]:
         """Muestra opciones y devuelve el índice elegido (None si el operador cancela)."""
 
+    def elegir_varias(self, titulo: str, mensaje: str, opciones: List[str]) -> Optional[List[int]]:
+        """Deja marcar varias opciones; devuelve sus índices (None si cancela).
+
+        Implementación por defecto (sin ventana propia): pregunta sí/no por cada opción.
+        """
+        elegidas = [i for i, texto in enumerate(opciones)
+                    if self.confirmar(titulo, f"{mensaje}\n\n¿Incluir este archivo?\n{texto}")]
+        return elegidas or None
+
     @abstractmethod
     def pedir_archivo(self, titulo: str, mensaje: str, carpeta_inicial: Path) -> Optional[Path]:
         """Deja seleccionar un archivo a mano. None si el operador decide omitirlo."""

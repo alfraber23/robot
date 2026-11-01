@@ -63,6 +63,9 @@ _CARGOS_FIRMA = [
 
 _TITULOS_FIRMA = ("LIC.", "ING.", "DR.", "DRA.", "MTRO.", "MTRA.", "SR.", "SRA.")
 
+# Palabra clave de los correos de corte de cuenta (asunto o cuerpo)
+_RE_CORTE = re.compile(r"\bCORTE\b")
+
 
 def _normalizar_firma(texto: str) -> str:
     sin_acentos = unicodedata.normalize("NFKD", texto or "")
@@ -119,6 +122,12 @@ class CorreoAlta:
     operador_firma: str = ""      # nombre literal de la firma ("Karina Cervantes")
     cargo_firma: str = ""         # cargo de la firma ("Analista de Cuentas")
     operador: str = ""            # nombre canónico ("Karina", "Paty", ...) o ""
+    es_corte: bool = False        # el correo es de un CORTE de cuenta (no de un alta)
+
+    @property
+    def operador_bitacora(self) -> str:
+        """En cortes el operador es el supervisor que envía el correo."""
+        return self.operador or _limpiar_nombre_firma(self.operador_firma) or self.remitente_nombre
 
     @property
     def hora_cajas(self) -> str:
@@ -886,6 +895,12 @@ class ProveedorCorreoOutlook:
             log.debug("  Firma: %r (%s) → operador=%r",
                       nombre_firma, cargo_firma, operador_canonico)
 
+        asunto_msg = getattr(msg, "Subject", "") or ""
+        es_corte = bool(_RE_CORTE.search(_normalizar_firma(asunto_msg))
+                        or _RE_CORTE.search(_normalizar_firma(cuerpo)))
+        if es_corte:
+            log.debug("  Correo de CORTE detectado: %r", asunto_msg[:80])
+
         return CorreoAlta(
             asunto=getattr(msg, "Subject", "") or "",
             remitente_nombre=remitente_nombre,
@@ -898,6 +913,7 @@ class ProveedorCorreoOutlook:
             operador_firma=nombre_firma,
             cargo_firma=cargo_firma,
             operador=operador_canonico,
+            es_corte=es_corte,
         )
 
     def _es_caja(self, direccion: str) -> bool:
@@ -925,7 +941,7 @@ class ProveedorCorreoOutlook:
             asunto = (getattr(msg, "Subject", "") or "").upper()
         except Exception:
             asunto = ""
-        if "ALTA" not in asunto:
+        if "ALTA" not in asunto and "CORTE" not in asunto:
             self._stats["sin_asunto_alta"] += 1
             return False, ""
 

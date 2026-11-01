@@ -187,7 +187,8 @@ class RobotDigitalizador:
         tareas: List[Tarea] = []
         for exp in inventario.expedientes:
             res = resolver_expediente(exp, self.cfg.nombre_servicios_especializados,
-                                      self.cfg.palabras_broker, self._preguntar_opcion)
+                                      self.cfg.palabras_broker, self._preguntar_opcion,
+                                      self.ui.confirmar, self.ui.elegir_varias)
             for ignorado in res.ignorados:
                 log.info("Ep %s | no se sube: %s", exp.episodio, ignorado)
             if res.faltante:
@@ -226,10 +227,13 @@ class RobotDigitalizador:
             match = self._correlacionar(tarea.doc)
             if match:
                 tarea.correo_alta = match
-                log.info("Ep %s (%s): alta confirmada en correo (%s, %s).",
+                if getattr(match, "es_corte", False):
+                    tarea.marcar_corte()
+                log.info("Ep %s (%s): %s confirmado en correo (%s, %s) | tipo: %s.",
                          tarea.doc.episodio, tarea.doc.paciente,
+                         "CORTE" if tarea.es_corte else "alta",
                          match.operador or match.operador_firma or "?",
-                         match.hora_cajas)
+                         match.hora_cajas, tarea.tipo_proceso.value)
                 filtradas.append(tarea)
             else:
                 log.info("Ep %s (%s): SIN alta en correo. Se omite (aún no se ha trabajado).",
@@ -503,7 +507,7 @@ class RobotDigitalizador:
             log.info("Seguro SHRINERS. Pasando directo a bitácora...")
         else:
             modo = "completo"
-            if not self._flujo_web(doc):
+            if not self._flujo_web(tarea):
                 return Resultado.OMITIDO, None
             self.portal.abrir_busqueda()
 
@@ -511,30 +515,100 @@ class RobotDigitalizador:
         return Resultado.PROCESADO, pendiente
 
     # ------------------------------------------------------------------
-    def _flujo_web(self, doc) -> bool:
-        """Sube los documentos del episodio. False si se aborta por cruce de aseguradora."""
-        self.portal.buscar_y_abrir_episodio(doc.episodio)
-        if not self.portal.validar_aseguradora(doc.compania):
-            autorizado = self.ui.confirmar(
-                "Posible cruce de aseguradora",
-                f"El portal no muestra la aseguradora del documento ({doc.compania}).\n"
-                f"Paciente: {doc.paciente}\nEpisodio: {doc.episodio}\n\n"
-                "¿Subir los documentos de todos modos?")
-            if not autorizado:
-                self._incidencia(f"{doc.nombre} (Ep {doc.episodio}): CRUCE de aseguradora, no se subió nada.")
-                self.portal.abrir_busqueda()
-                return False
-            log.warning("El operador autorizó continuar pese al aviso de cruce (Ep %s).", doc.episodio)
+    def _flujo_web(self, tarea: Tarea) -> bool:
+        """Sube los documentos del episodio. False si se aborta por cruce de aseguradora.
 
-        compania = doc.compania.upper()
+        Alta normal: 1 estado de cuenta en la primera carpetita roja.
+        Corte / separación: un estado de cuenta por carpetita (se reutilizan las existentes y
+        se crean solo las que falten). Visados y adicionales se suben a cada carpetita.
+        """
+        doc = tarea.doc
+        estados = tarea.estados_de_cuenta
+        if tarea.es_corte or tarea.es_separacion:
+            log.info("Ep %s: %s con %d estado(s) de cuenta.", doc.episodio,
+                     tarea.tipo_proceso.value.upper(), len(estados))
+            carpetas = self._preparar_carpetas(tarea, len(estados))
+        else:
+            carpetas = [None]      # alta normal: la primera carpetita, como siempre
 
+        adicionales: Optional[List[Tuple[Path, str]]] = None
+        for numero, (estado, id_fila) in enumerate(zip(estados, carpetas), start=1):
+            if id_fila is None:
+                self.portal.buscar_y_abrir_episodio(doc.episodio)
+            else:
+                log.info("Ep %s: estado de cuenta %d/%d (%s) -> carpetita fila %s.",
+                         doc.episodio, numero, len(estados), estado.nombre, id_fila)
+                self.portal.buscar_episodio(doc.episodio)
+                self.portal.abrir_carpeta(id_fila)
+
+            if numero == 1 and not self.portal.validar_aseguradora(doc.compania):
+                autorizado = self.ui.confirmar(
+                    "Posible cruce de aseguradora",
+                    f"El portal no muestra la aseguradora del documento ({doc.compania}).\n"
+                    f"Paciente: {doc.paciente}\nEpisodio: {doc.episodio}\n\n"
+                    "¿Subir los documentos de todos modos?")
+                if not autorizado:
+                    self._incidencia(f"{doc.nombre} (Ep {doc.episodio}): CRUCE de aseguradora, no se subió nada.")
+                    self.portal.abrir_busqueda()
+                    return False
+                log.warning("El operador autorizó continuar pese al aviso de cruce (Ep %s).", doc.episodio)
+
+            self._subir_estado_cuenta(estado)
+            if adicionales is None:     # se buscan una sola vez y se replican en cada carpetita
+                adicionales = self._resolver_adicionales(doc, separacion=len(estados) > 1)
+            for ruta, tipo in adicionales:
+                self._subir(estado, ruta, tipo)
+        return True
+
+    def _preparar_carpetas(self, tarea: Tarea, necesarias: int) -> List[str]:
+        """Devuelve los id de fila de las carpetitas donde se digitalizará cada estado de cuenta.
+
+        Validación previa (no crear de más):
+          - Corte: se abre la ÚLTIMA carpetita; si su estado de cuenta está libre se reutiliza.
+          - Separación (alta): se usan las carpetitas existentes en orden.
+        Solo se crean las que falten.
+        """
+        ep = tarea.doc.episodio
+        ids = self.portal.buscar_episodio(ep)
+        if not ids:
+            raise ErrorPortal(f"El episodio {ep} no tiene ninguna carpetita roja en el portal.")
+        codigo = self.portal.codigo_asegurador(ids[-1])
+        log.info("Ep %s: carpetitas existentes: %d (filas %s).", ep, len(ids), ", ".join(ids))
+
+        if tarea.es_corte:
+            ultima = ids[-1]
+            self.portal.abrir_carpeta(ultima)
+            libre = self.portal.puede_digitalizar_estado_cuenta()
+            usables = [ultima] if libre else []
+            log.info("Ep %s (corte): la última carpetita (fila %s) %s.", ep, ultima,
+                     "está libre y se reutiliza" if libre else "ya está ocupada")
+            self.portal.buscar_episodio(ep)
+        else:
+            usables = ids[:necesarias]
+
+        faltan = necesarias - len(usables)
+        if faltan > 0:
+            log.info("Ep %s: se crearán %d carpetita(s) roja(s).", ep, faltan)
+        else:
+            log.info("Ep %s: no hace falta crear carpetitas.", ep)
+        for _ in range(faltan):
+            usables.append(self.portal.crear_carpetita(ep, codigo))
+            self.portal.buscar_episodio(ep)
+        return usables
+
+    def _subir_estado_cuenta(self, doc) -> None:
         # Estado de cuenta (AXA en PDF: solo la última hoja)
-        if "AXA" in compania and doc.tipo == "pdf":
+        if "AXA" in doc.compania.upper() and doc.tipo == "pdf":
             contexto = ultima_pagina_temporal(doc.ruta, doc.episodio)
         else:
             contexto = nullcontext(doc.ruta)
         with contexto as ruta_estado_cuenta:
             self._subir(doc, ruta_estado_cuenta, "estado de cuenta")
+
+    def _resolver_adicionales(self, doc, separacion: bool = False) -> List[Tuple[Path, str]]:
+        """Busca (o pide) los documentos adicionales de la aseguradora: [(ruta, tipo de fila)]."""
+        compania = doc.compania.upper()
+        adicionales: List[Tuple[Path, str]] = []
 
         # MetLife: control de costos (nombre libre: se busca dentro del archivo)
         if "METLIFE" in compania:
@@ -542,21 +616,27 @@ class RobotDigitalizador:
                 doc, "el control de costos de MetLife",
                 lambda: self.buscador.por_nombre_y_clave(doc.paciente, "Control de Costos"))
             if ruta:
-                self._subir(doc, ruta, "reporte de control de costos")
+                adicionales.append((ruta, "reporte de control de costos"))
 
         # Visados locales con auditoría
         if contiene_alguna(compania, SEGUROS_CON_VISADO):
             ruta_visado = self._buscar_o_pedir(
                 doc, "el visado", lambda: self.buscador.visado_por_episodio(doc.episodio))
             if ruta_visado:
-                log.info("Iniciando auditoría local para %s...", doc.compania)
-                texto_edo = extraer_texto_completo(doc.ruta)
-                texto_vis = extraer_texto_completo(ruta_visado)
-                if self.auditoria.validar_cuadre(texto_edo, texto_vis):
-                    self._subir(doc, ruta_visado, "visado")
+                if separacion:
+                    # Cada estado de cuenta es una parte: no cuadra por separado con el visado.
+                    log.info("Separación de cuentas: se omite la auditoría individual; "
+                             "el mismo visado se sube a cada carpetita.")
+                    adicionales.append((ruta_visado, "visado"))
                 else:
-                    log.warning("Visado bloqueado. No se subió al portal.")
-                    self._faltante(doc, "el visado (no cuadra / rechazado)")
+                    log.info("Iniciando auditoría local para %s...", doc.compania)
+                    texto_edo = extraer_texto_completo(doc.ruta)
+                    texto_vis = extraer_texto_completo(ruta_visado)
+                    if self.auditoria.validar_cuadre(texto_edo, texto_vis):
+                        adicionales.append((ruta_visado, "visado"))
+                    else:
+                        log.warning("Visado bloqueado. No se subió al portal.")
+                        self._faltante(doc, "el visado (no cuadra / rechazado)")
 
         # Banorte / Plan Seguro: resumen de importes (CtrlGastos<episodio> por nombre; si no, por contenido)
         if contiene_alguna(compania, SEGUROS_CON_RESUMEN):
@@ -566,8 +646,8 @@ class RobotDigitalizador:
                          or self.buscador.por_episodio_y_clave(doc.episodio, "RESUMEN DE IMPORTES")))
             if ruta:
                 log.info("Resumen de importes: %s", ruta.name)
-                self._subir(doc, ruta, "Control de gastos")
-        return True
+                adicionales.append((ruta, "Control de gastos"))
+        return adicionales
 
     def _buscar_o_pedir(self, doc, descripcion: str, buscar: Callable[[], Optional[Path]]) -> Optional[Path]:
         """Busca un documento adicional; si no aparece, deja que el operador lo seleccione a mano."""
@@ -610,6 +690,11 @@ class RobotDigitalizador:
                      doc.episodio)
             return None
 
+        if tarea.es_corte:
+            # Los cortes no aparecen en ECH: la hora es la del correo del supervisor
+            hora_alta = tarea.correo_alta.hora_cajas if tarea.correo_alta else "N/A"
+            log.info("Ep %s (corte): se omite ECH; hora = hora del correo (%s).", doc.episodio, hora_alta)
+            return (tarea, compania, modo, hora_alta)
         hora_alta = self._obtener_hora_alta(doc.episodio)
         return (tarea, compania, modo, hora_alta)
 
@@ -634,6 +719,20 @@ class RobotDigitalizador:
         if match and match.hora_cajas:
             sugeridos.hora_cajas = match.hora_cajas
 
+        if tarea.es_corte:
+            # Corte: 100% automático. El operador es el supervisor del correo; no se llama al paciente.
+            supervisor = (match.operador_bitacora if match else "") or self.operador or "N/A"
+            datos = DatosManuales(broker=tarea.broker or "N/A", vobo="N/A",
+                                  hora_cajas=sugeridos.hora_cajas, respuesta_hab="N/A",
+                                  operador=supervisor)
+            log_manual.info("Ep %s (corte): bitácora automática, operador = supervisor (%s).",
+                            doc.episodio, supervisor)
+            self._registrar_bitacora(RegistroBitacora(
+                episodio=doc.episodio, habitacion=doc.habitacion, paciente=doc.paciente,
+                seguro=normalizar_aseguradora(compania), operador=supervisor,
+                datos=datos, hora_alta=hora_alta))
+            return
+
         operador_correo = (match.operador if match else "") or ""
         pedir_operador = not bool(operador_correo or self.operador)
         if pedir_operador:
@@ -654,7 +753,9 @@ class RobotDigitalizador:
             episodio=doc.episodio, habitacion=doc.habitacion, paciente=doc.paciente,
             seguro=normalizar_aseguradora(compania), operador=operador_bitacora,
             datos=datos, hora_alta=hora_alta)
+        self._registrar_bitacora(registro)
 
+    def _registrar_bitacora(self, registro: RegistroBitacora) -> None:
         if self.bitacora.disponible:
             if self.bitacora.registrar(registro):
                 self._guardar_para_pegar(registro)
